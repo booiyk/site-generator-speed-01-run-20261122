@@ -405,34 +405,41 @@ function findSingleStar(s, from, end) {
 const SPECIAL_RE = /[\\`*[]/g;
 
 /** First index in [from, end) holding one of \\ ` * [, or -1. */
+const NEXT_SPECIAL_RE = /[\\`*[&<>"']/g;
 function nextSpecial(s, from, end) {
-  let best = -1;
-  const b1 = s.indexOf('\\', from);
-  if (b1 !== -1 && b1 < end) best = b1;
-  const b2 = s.indexOf('`', from);
-  if (b2 !== -1 && b2 < end && (best === -1 || b2 < best)) best = b2;
-  const b3 = s.indexOf('*', from);
-  if (b3 !== -1 && b3 < end && (best === -1 || b3 < best)) best = b3;
-  const b4 = s.indexOf('[', from);
-  if (b4 !== -1 && b4 < end && (best === -1 || b4 < best)) best = b4;
-  return best;
+  NEXT_SPECIAL_RE.lastIndex = from;
+  const m = NEXT_SPECIAL_RE.exec(s);
+  if (m === null || m.index >= end) return -1;
+  return m.index;
+}
+
+/** A plain run [plain, n) pushed escaped iff it holds an HTML special. */
+function pushRun(out, s, plain, n, dirty) {
+  if (n > plain) out.push(dirty ? esc(s.slice(plain, n)) : s.slice(plain, n));
 }
 
 /** `s[a..b)` rendered inline into `out`; `env.link(target)` resolves a link's href. */
 function inlineRange(s, a, b, env, out) {
   let i = a;
   let plain = a;
+  let dirty = false;
   while (i < b) {
     const n = nextSpecial(s, i, b);
     if (n === -1) break;
     const c = s[n];
+    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
+      dirty = true;
+      i = n + 1;
+      continue;
+    }
     if (c === '\\') {
       if (n + 1 < b && ESCAPABLE.has(s[n + 1])) {
-        if (n > plain) out.push(esc(s.slice(plain, n)));
+        pushRun(out, s, plain, n, dirty);
         const nx = s[n + 1];
         out.push(nx === '>' ? '&gt;' : nx);
         i = n + 2;
         plain = i;
+        dirty = false;
       } else {
         i = n + 1; // backslash itself: stays in the plain run
       }
@@ -441,10 +448,11 @@ function inlineRange(s, a, b, env, out) {
     if (c === '`') {
       const j = s.indexOf('`', n + 1);
       if (j !== -1 && j < b && j > n + 1) {
-        if (n > plain) out.push(esc(s.slice(plain, n)));
+        pushRun(out, s, plain, n, dirty);
         out.push('<code>', esc(s.slice(n + 1, j)), '</code>');
         i = j + 1;
         plain = i;
+        dirty = false;
       } else {
         i = n + 1; // no closer: backtick itself
       }
@@ -454,24 +462,26 @@ function inlineRange(s, a, b, env, out) {
       if (s[n + 1] === '*') {
         const j = findUnescaped(s, '**', n + 2, b);
         if (j > n + 2) {
-          if (n > plain) out.push(esc(s.slice(plain, n)));
+          pushRun(out, s, plain, n, dirty);
           out.push('<strong>');
           inlineRange(s, n + 2, j, env, out);
           out.push('</strong>');
           i = j + 2;
           plain = i;
+          dirty = false;
         } else {
           i = n + 2; // no closer: ** itself
         }
       } else {
         const j = findSingleStar(s, n + 1, b);
         if (j > n + 1) {
-          if (n > plain) out.push(esc(s.slice(plain, n)));
+          pushRun(out, s, plain, n, dirty);
           out.push('<em>');
           inlineRange(s, n + 1, j, env, out);
           out.push('</em>');
           i = j + 1;
           plain = i;
+          dirty = false;
         } else {
           i = n + 1; // no closer: * itself
         }
@@ -485,19 +495,20 @@ function inlineRange(s, a, b, env, out) {
       if (m !== -1 && m < b) {
         const target = s.slice(k + 2, m);
         if (target !== '' && !WS_RE.test(target)) {
-          if (n > plain) out.push(esc(s.slice(plain, n)));
+          pushRun(out, s, plain, n, dirty);
           out.push('<a href="', esc(env.link(target)), '">');
           inlineRange(s, n + 1, k, env, out);
           out.push('</a>');
           i = m + 1;
           plain = i;
+          dirty = false;
           continue;
         }
       }
     }
     i = n + 1; // not a link: [ itself
   }
-  if (b > plain) out.push(esc(s.slice(plain, b)));
+  pushRun(out, s, plain, b, dirty);
 }
 
 /** Any inline markup or HTML special: text without one renders as itself. */
@@ -1006,9 +1017,9 @@ const dirOf = (path) => {
   return i === -1 ? '' : path.slice(0, i);
 };
 
-/** `rel` from the directory `dir` of a source, or null when it climbs out of the root. */
-function resolvePath(dir, rel) {
-  const parts = dir === '' ? [] : dir.split('/');
+/** `rel` from a source's directory (its pre-split parts), or null when it climbs out of the root. */
+function resolvePath(dirParts, rel) {
+  const parts = dirParts.slice();
   let start = 0;
   for (let k = 0; k <= rel.length; k++) {
     if (k === rel.length || rel.charCodeAt(k) === 47) {
@@ -1126,6 +1137,7 @@ export function run(input) {
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
     const dir = dirOf(s.path);
+    const dirParts = dir === '' ? [] : dir.split('/');
     const srcPath = s.path;
     const env = {
       link: (target) => {
@@ -1133,7 +1145,7 @@ export function run(input) {
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
+        const path = rel === '' ? null : resolvePath(dirParts, rel);
         if (path !== null) {
           const page = bySource.get(path);
           if (page !== undefined) return page.url + frag;
